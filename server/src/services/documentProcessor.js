@@ -240,187 +240,119 @@ const parseFullName = (fullName) => {
 
 const extractEntitiesSimple = (document) => {
   const raw = document.entities || [];
-  return raw.map((entity, idx) => {
-    // normalize type and text value
-    const type = (entity.type || '').toLowerCase().trim();
-    const value = String(entity.mentionText || entity.text || '').trim();
+  return raw.map((entity) => {
+    // 1. Clean Value
+    const value = String(entity.mentionText || entity.textAnchor?.content || '').trim();
+    
+    // 2. Get Type (Normalize to lowercase for safety)
+    const type = (entity.type || 'text').toLowerCase().trim();
 
-    // Attempt to pull startIndex / endIndex from textAnchor.textSegments
-    let startIndex = undefined;
-    let endIndex = undefined;
-    try {
-      const ta = entity.textAnchor || {};
-      const segs = ta.textSegments || (ta.textSegments === 0 ? [] : ta.textSegments);
-      if (Array.isArray(segs) && segs.length > 0) {
-        // textSegments usually contains objects with startIndex/endIndex (strings or numbers)
-        const seg = segs[0];
-        // Some SDKs return strings for int64 — coerce to Number if possible
-        startIndex = seg.startIndex !== undefined ? Number(seg.startIndex) : undefined;
-        endIndex = seg.endIndex !== undefined ? Number(seg.endIndex) : undefined;
-      }
-    } catch (e) {
-      // non-fatal — we'll fallback to order index below
-    }
-
-    // --- NEW: Extract Bounding Box Coordinates ---
-    let midY = null;
-    let midX = null;
+    // 3. Get Vertical Center (midY) for Row Grouping
+    let midY = 0;
     try {
       const vertices = entity.pageAnchor?.pageRefs?.[0]?.boundingPoly?.normalizedVertices;
       if (vertices && vertices.length >= 4) {
-        const ys = vertices.map(v => v.y || 0);
-        const xs = vertices.map(v => v.x || 0);
-        const minY = Math.min(...ys);
-        const maxY = Math.max(...ys);
-        const minX = Math.min(...xs);
-        midY = (minY + maxY) / 2;
-        midX = minX;
+        const ys = vertices.map(v => v.y);
+        midY = (Math.min(...ys) + Math.max(...ys)) / 2;
+      } else {
+        // Without geometry, we can't place it in a row. Skip.
+        return null;
       }
-    } catch (e) {
-      // non-fatal
-    }
+    } catch (e) { return null; }
 
+    if (!value) return null;
 
-    return {
-      type,
-      value,
-      // if startIndex is NaN or undefined, set to null so we can detect missing anchors
-      startIndex: Number.isFinite(startIndex) ? startIndex : null,
-      endIndex: Number.isFinite(endIndex) ? endIndex : null,
-      midY,
-      midX,
-      // keep original raw entity for debugging if needed
-      __raw: entity,
-      __order: idx
-    };
-  }).filter(e => e.value); // drop empties
+    return { type, value, midY };
+  }).filter(e => e !== null);
 };
 
 
 const simpleGrouping = (entities) => {
-  if (!Array.isArray(entities) || entities.length === 0) return [];
-  const ROW_Y_TOLERANCE = 0.01;
+  if (!entities || entities.length === 0) return [];
 
+  // --- 1. IDENTIFY ROW ANCHORS (NAMES) ---
+  // We rely on the 'name' entity to be the "Spine" of the table.
+  // Filter: Must be type 'name' AND have meaningful text (avoid icons/checkboxes)
+  let anchors = entities
+    .filter(e => (e.type === 'name' || e.type === 'person_name') && e.value.length > 2)
+    .sort((a, b) => a.midY - b.midY);
 
-  const pureStartIndexGrouping = (entitySubset) => {
-    // This is the original fallback logic, to be used when coordinate data is insufficient
-    const sorted = [...entitySubset].sort((a, b) => (a.startIndex ?? a.__order) - (b.startIndex ?? b.__order));
-    const nameEntities = sorted.filter(e => e.type === 'name');
-    const records = [];
-
-
-    for (let i = 0; i < nameEntities.length; i++) {
-      const nameEnt = nameEntities[i];
-      const nextName = nameEntities[i + 1];
-      const nameStart = nameEnt.startIndex ?? nameEnt.__order;
-      const boundary = nextName?.startIndex ?? Number.MAX_SAFE_INTEGER;
-      const slice = sorted.filter(e => (e.startIndex ?? e.__order) >= nameStart && (e.startIndex ?? e.__order) < boundary);
-
-
-      const record = {};
-      const { first, last } = parseFullName(nameEnt.value);
-      record.first_name = first;
-      record.last_name = last;
-
-
-      const getFirst = (type) => slice.find(s => s.type === type)?.value;
-      record.mobile = getFirst('mobile');
-      record.address = getFirst('address');
-      record.email = getFirst('email');
-      record.dateofbirth = getFirst('dateofbirth');
-      record.landline = getFirst('landline');
-      record.lastseen = getFirst('lastseen');
-      records.push(record);
-    }
-    return records;
-  };
-
-
-  const withCoords = entities.filter(e => e.midY !== null && e.midX !== null);
-  const withoutCoords = entities.filter(e => e.midY === null || e.midX === null);
-
-
-  if (withCoords.length / entities.length < 0.5) {
-    logger.debug('Insufficient coordinate data. Using pure startIndex grouping.');
-    return pureStartIndexGrouping(entities);
-  }
-  logger.debug('Using hybrid coordinate/startIndex grouping.');
-
-
-  // 1. Form rows from entities that have coordinates
-  const sortedWithCoords = withCoords.sort((a, b) => a.midY - b.midY || a.midX - b.midX);
-  const rows = [];
-  if (sortedWithCoords.length > 0) {
-    let currentRow = [sortedWithCoords[0]];
-    for (let i = 1; i < sortedWithCoords.length; i++) {
-      const curr = sortedWithCoords[i];
-      if (Math.abs(curr.midY - currentRow[0].midY) < ROW_Y_TOLERANCE) {
-        currentRow.push(curr);
-      } else {
-        rows.push(currentRow);
-        currentRow = [curr];
-      }
-    }
-    rows.push(currentRow);
+  if (anchors.length === 0) {
+    // Fallback: If model didn't label names, we can't group by row.
+    // You might check for 'address' anchors here if names are missing, 
+    // but you stated names are present in all records.
+    logger.warn("No 'name' entities found. Grouping failed.");
+    return [];
   }
 
+  // --- 2. DEFINE VERTICAL ROW ZONES ---
+  // We calculate the invisible horizontal lines that separate rows.
+  // Rule: The boundary is exactly halfway between this Name and the next Name.
+  const records = anchors.map((anchor, i) => {
+    // Top Boundary
+    let topY = 0;
+    if (i > 0) {
+      topY = (anchors[i - 1].midY + anchor.midY) / 2;
+    }
 
-  // 2. Create a map of row boundaries based on startIndex
-  const rowBoundaries = rows.map(row => {
-    const indices = row.map(e => e.startIndex).filter(idx => idx !== null);
+    // Bottom Boundary
+    let bottomY = 1.0;
+    if (i < anchors.length - 1) {
+      bottomY = (anchor.midY + anchors[i + 1].midY) / 2;
+    }
+
     return {
-      row,
-      minIdx: Math.min(...indices, Number.MAX_SAFE_INTEGER),
-      maxIdx: Math.max(...indices, -1),
+      anchor,
+      topY,
+      bottomY,
+      // The "Bag" to hold all entities for this person
+      items: [] 
     };
   });
 
+  // --- 3. DISTRIBUTE ENTITIES BY ROW (Y-AXIS ONLY) ---
+  // We don't care about X columns. We only care: "Which row does this belong to?"
+  entities.forEach(e => {
+    // Skip the anchor itself to avoid duplication
+    if (e === e.anchor) return; 
 
-  // 3. Slot entities without coordinates into the coordinate-based rows
-  const unslotted = [];
-  for (const entity of withoutCoords) {
-    if (entity.startIndex === null) {
-      unslotted.push(entity);
-      continue;
+    // Find the row this entity sits inside
+    const rec = records.find(r => e.midY >= r.topY && e.midY < r.bottomY);
+    
+    if (rec) {
+      rec.items.push(e);
     }
-    const targetRow = rowBoundaries.find(b => entity.startIndex >= b.minIdx && entity.startIndex <= b.maxIdx);
-    if (targetRow) {
-      targetRow.row.push(entity);
-    } else {
-      unslotted.push(entity);
-    }
-  }
-
-
-  // 4. Build records from the completed coordinate-based rows
-  const coordRecords = rows.map(row => {
-    row.sort((a, b) => (a.midX ?? a.startIndex ?? a.__order) - (b.midX ?? b.startIndex ?? b.__order));
-    const record = {};
-    const nameEntity = row.find(e => e.type === 'name');
-    if (nameEntity) {
-      const { first, last } = parseFullName(nameEntity.value);
-      record.first_name = first;
-      record.last_name = last;
-    }
-    const getFirst = (type) => row.find(e => e.type === type)?.value;
-    record.mobile = getFirst('mobile');
-    record.address = getFirst('address');
-    record.email = getFirst('email');
-    record.dateofbirth = getFirst('dateofbirth');
-    record.landline = getFirst('landline');
-    record.lastseen = getFirst('lastseen');
-    return record;
   });
 
+  // --- 4. MAP BY ENTITY TYPE ---
+  return records.map(r => {
+    // Helper: Find all items of a specific type in this row
+    const getByType = (type) => r.items
+      .filter(e => e.type === type)
+      .map(e => e.value)
+      .join(' ') // Join duplicates (e.g. multi-line address)
+      .trim();
 
-  // 5. Process any remaining unslotted entities using the original fallback logic
-  const fallbackRecords = pureStartIndexGrouping(unslotted);
+    // Name: We use the anchor's own value + any extra name parts found in the row
+    const nameExtras = getByType('name'); 
+    const fullName = r.anchor.value + (nameExtras ? ' ' + nameExtras : '');
 
+    // Use your parser for splitting
+    const { first, last } = parseFullName(fullName);
 
-  return [...coordRecords, ...fallbackRecords];
+    return {
+      first_name: first,
+      last_name: last,
+      // Map strictly by the DocAI label
+      dateofbirth: getByType('date_of_birth') || getByType('dob') || getByType('dateofbirth'), 
+      address: getByType('address'),
+      mobile: getByType('mobile') || getByType('phone_number'), // Handle common aliases
+      email: getByType('email'),
+      landline: getByType('landline'),
+      lastseen: getByType('last_seen') || getByType('lastseen')
+    };
+  });
 };
-
-
 
 const _single_line_address = (address) => {
   if (!address) return '';
